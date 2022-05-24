@@ -1,0 +1,169 @@
+name: Distribution Builder
+on:
+  push:
+env:
+  USER: root
+  LOGNAME: root
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Init
+        run: |
+          echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+      - name: Cache
+        id: cache
+        uses: actions/cache@v3
+        with:
+          path: ~/sid-base-amd64.tgz
+          key: ${{ runner.os }}-primes
+      - name: Create base
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get -y install pbuilder debian-archive-keyring
+          sudo pbuilder create --architecture amd64 \
+                               --mirror "http://ftp.us.debian.org/debian/" \
+                               --distribution "sid" \
+                               --basetgz ~/sid-base-amd64.tgz \
+                               --allow-untrusted \
+                               --debootstrapopts --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+                               --debootstrapopts --include=debian-archive-keyring,ca-certificates
+      - uses: actions/checkout@v3
+      - id: matrix
+        name: Matrix
+        shell: bash
+        run: |
+          array=""
+          while IFS= read -r line
+          do
+            if [[ ! -n "$array" ]]
+            then
+              array='"'$line'"'
+            else
+              array=$array", "'"'$line'"'
+            fi
+          done < "repos"
+          echo $array
+          echo "::set-output name=value::[$array]"
+  build:
+    needs: [ setup ]
+    continue-on-error: true
+    strategy:
+      matrix:
+        value: ${{fromJson(needs.setup.outputs.matrix)}}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Cache
+        id: cache
+        uses: actions/cache@v3
+        with:
+          path: ~/sid-base-amd64.tgz
+          key: ${{ runner.os }}-primes
+      - name: Install dep
+        run: |
+          sudo apt-get update
+          sudo apt-get install reprepro pbuilder dh-make -y
+      - name: Build
+        run: |
+          mkdir ~/hooks
+          cp D50Update ~/hooks/
+          cp sources.list ~/hooks/
+          git clone https://github.com/linuxdeepin/${{ matrix.value }}
+          cd ${{ matrix.value }}
+              PROJECT_NAME=$(dpkg-parsechangelog -S Source)
+              version=$(git describe --long --tags | sed 's/\([^-]*-g\)/r\1/;s/-/./g')
+              new_dir=${PROJECT_NAME}-$version
+              mkdir $new_dir
+              rsync -a . $new_dir --exclude $new_dir
+              cd $new_dir
+                  rm -rf $new_dir
+                  dch -M -bv "${version}-1" "update"
+                  if [ -f ./debian/source/format ]; then sed -i 's/native/quilt/g' './debian/source/format'; fi
+                  dh_make --createorig -sy || true
+                  dpkg-source -b ./
+              cd ..
+              sudo pbuilder --build \
+                            --basetgz ~/sid-base-amd64.tgz \
+                            --allow-untrusted \
+                            --hookdir ~/hooks \
+                            --use-network yes \
+                            --logfile `uname -m`-build.log \
+                            --aptcache "" \
+                            --buildresult . ./*.dsc
+          cd ..
+          mkdir ~/deb
+          find -name "*.deb" | xargs -I {} cp {} ~/deb
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.value }}
+          path: ~/deb/*
+  package:
+    needs: [ build ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: webfactory/ssh-agent@v0.5.4
+        name: Import SSH key
+        with:
+          ssh-private-key: ${{ secrets.BUILD_SSH_PRIVATE_KEY }}
+      - run: git config --global user.email "justforlxz@gmail.com"
+      - run: git config --global user.name "justforlxz"
+      - name: Install dep
+        run: |
+          sudo apt-get install reprepro davfs2 -y
+      - name: Lock Database
+        shell: bash
+        id: lock
+        run: |
+          for (( ; ; ))
+          do
+            git clone git@github.com:deepin-community/push-sleep.git
+            cd push-sleep
+            git checkout debian
+            if [[ -f "lock" ]];
+            then
+              sleep 10
+              rm -rf push-sleep
+              continue
+            else
+              touch lock
+              git add lock
+              git commit -m "lock debian"
+              for (( ; ; ))
+              do
+                git push && break
+                sleep 10
+              done
+            fi
+            break
+          done
+          echo ::set-output name=exit_code::0
+      - name: Mount webdav
+        run: |
+          sudo tee /etc/davfs2/secrets <<< "https://webdav.mkacg.com ${{ secrets.WEBDAV_USER }} ${{ secrets.WEBDAV_PASSWD }}"
+          sudo tee /etc/davfs2/davfs2.conf <<< "use_locks 0"
+          mkdir .repo
+          sudo mount -t davfs https://webdav.mkacg.com/ .repo
+      - name: Download all packages
+        uses: actions/download-artifact@v3
+        with:
+          path: ./deb
+      - name: Upload packages
+        run: |
+          find deb -name "*.deb" | xargs -I {} sudo reprepro --delete -b .repo/debian -C main includedeb commit {}
+      - name: Unmount webdav
+        run: |
+          sudo umount -i -f -l .repo
+      - name: Unlock
+        if: ${{ always() }} || ${{ steps.lock.outputs.exit_code == 0 }}
+        run: |
+          cd push-sleep
+          git reset HEAD^
+          rm -rf lock
+          git push -f

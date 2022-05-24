@@ -1,0 +1,12 @@
+deepin-desktop-base
+deepin-desktop-schemas
+go-lib
+go-x11-client
+go-gir-generator
+go-dbus-factory
+dtkcommon
+dtkcore
+dtkwidget
+dtkgui
+qt5integration
+qt5platform-plugins

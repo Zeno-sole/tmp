@@ -1,0 +1,2 @@
+deb [trusted=yes] https://packages.mkacg.com/debian commit main
+deb http://ftp.us.debian.org/debian/ sid main contrib non-free
