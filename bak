@@ -10,3 +10,4 @@ dtkwidget
 dtkgui
 qt5integration
 qt5platform-plugins
+dde-dock
